@@ -98,3 +98,12 @@ def test_symlinks_are_not_followed(tmp_path):
     repo.mkdir()
     (repo / "linked").symlink_to(outside)
     assert "linked/LICENSE" not in compute_signals(repo)["tree"]
+
+
+def test_gitlab_templates_and_rspec_count(tmp_path):
+    (tmp_path / ".gitlab" / "issue_templates").mkdir(parents=True)
+    (tmp_path / ".gitlab" / "issue_templates" / "Bug.md").write_text("x")
+    (tmp_path / "spec").mkdir()
+    (tmp_path / "spec" / "app_spec.rb").write_text("x")
+    passing = compute_signals(tmp_path)["dimensions"][2]["passing"]
+    assert {"present:issue_pr_templates", "present:tests"} <= set(passing)

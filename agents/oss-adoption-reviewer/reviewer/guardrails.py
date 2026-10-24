@@ -3,6 +3,7 @@ import fnmatch
 import json
 import os
 import re
+import tempfile
 from pathlib import Path
 
 from google.adk.models.llm_response import LlmResponse
@@ -18,20 +19,36 @@ DIMENSIONS = [
 SECRET_GLOBS = [".env*", "*.pem", "*.key", "id_rsa*"]
 SECRET_RE = re.compile(r"sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{30,}|AQ\.[0-9A-Za-z_-]{30,}|ghp_[A-Za-z0-9]{30,}")
 SIGNAL_RE = re.compile(r"\b(?:missing|present|flag|adoption):[\w=./-]+")
+# Public GitHub repo root only: https, no credentials, query, branch path, or option-like names.
+GITHUB_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/([A-Za-z0-9_.-]{1,100}?)(?:\.git)?/?")
 
 
 def review_root() -> Path:
     return Path(os.environ.get("REVIEW_ROOT", ".")).resolve()
 
 
+def clone_root() -> Path:
+    """Where `clone_repo` puts shallow clones. Same value in the agent and the MCP server (shared env)."""
+    return Path(os.environ.get("CLONE_DIR") or Path(tempfile.gettempdir()) / "oss-adoption-reviewer-clones").resolve()
+
+
+def parse_github_url(url: str) -> tuple[str, str]:
+    """(owner, repo) for a public GitHub repo URL, else ValueError."""
+    m = GITHUB_URL_RE.fullmatch(url.strip())
+    if not m or m.group(2).strip(".") == "":
+        raise ValueError(f"only https://github.com/<owner>/<repo> URLs are supported: {url!r}")
+    return m.group(1), m.group(2)
+
+
 def safe_path(path: str) -> Path:
-    """Resolve `path` (following symlinks) and require it to stay under REVIEW_ROOT."""
+    """Resolve `path` (following symlinks) and require it to stay under REVIEW_ROOT or the clone directory."""
     root = review_root()
     p = Path(path)
     resolved = (p if p.is_absolute() else root / p).resolve()
-    if resolved != root and root not in resolved.parents:
-        raise PermissionError(f"path escapes REVIEW_ROOT: {path}")
-    return resolved
+    for allowed in (root, clone_root()):
+        if resolved == allowed or allowed in resolved.parents:
+            return resolved
+    raise PermissionError(f"path escapes REVIEW_ROOT: {path}")
 
 
 def is_secret_file(path: Path) -> bool:
@@ -56,7 +73,13 @@ def before_model_callback(callback_context, llm_request):
 
 
 def before_tool_callback(tool, args, tool_context):
-    """Second enforcement of the sandbox, in case the MCP server is bypassed."""
+    """Second enforcement of the sandbox and URL allow-list, in case the MCP server is bypassed."""
+    if tool.name == "clone_repo":
+        try:
+            parse_github_url(str(args.get("url", "")))
+        except ValueError as e:
+            return {"error": str(e)}
+        return None
     path = args.get("path")
     if path is None:
         return None
@@ -69,8 +92,8 @@ def before_tool_callback(tool, args, tool_context):
     return None
 
 
-def scan_scores(tool_response) -> dict | None:
-    """Per-dimension scores from a `scan_repo` MCP result (structured content, else the JSON text block)."""
+def scan_scores(tool_response) -> tuple[dict, int] | None:
+    """(per-dimension scores, issue count) from a `scan_repo` MCP result (structured content, else the JSON text)."""
     if not isinstance(tool_response, dict):
         return None
     data = tool_response.get("structuredContent")
@@ -82,15 +105,16 @@ def scan_scores(tool_response) -> dict | None:
         except (KeyError, IndexError, TypeError, ValueError):
             return None
     try:
-        return {d["name"]: int(d["score"]) for d in data["dimensions"]}
+        return ({d["name"]: int(d["score"]) for d in data["dimensions"]},
+                sum(len(d["issues"]) for d in data["dimensions"]))
     except (KeyError, TypeError, ValueError):
         return None
 
 
 def after_tool_callback(tool, args, tool_context, tool_response):
     """Remember the deterministic scores so the final report can be held to them."""
-    if tool.name == "scan_repo" and (scores := scan_scores(tool_response)):
-        tool_context.state["temp:scores"] = scores
+    if tool.name == "scan_repo" and (scan := scan_scores(tool_response)):
+        tool_context.state["temp:scores"], tool_context.state["temp:issue_count"] = scan
     return None
 
 
@@ -132,7 +156,8 @@ def after_model_callback(callback_context, llm_response):
     missing = [d for d in DIMENSIONS if d.lower() not in lowered]
     if missing:
         problems.append("missing dimension sections: " + ", ".join(missing))
-    if not SIGNAL_RE.search(text):
+    issue_count = callback_context.state.get("temp:issue_count", 1) if callback_context else 1
+    if not SIGNAL_RE.search(text) and issue_count:  # a repo with no issues has nothing to cite
         problems.append("no cited signal ids (e.g. missing:license)")
     if problems:
         text += "\n\n> ⚠️ Output check failed: " + "; ".join(problems) + "."

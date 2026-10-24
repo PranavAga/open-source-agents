@@ -1,19 +1,23 @@
-"""Read-only MCP server (stdio): deterministic adoption signals for a local repo."""
+"""MCP server (stdio): deterministic adoption signals for a local repo, plus shallow clones of public GitHub repos.
+
+Nothing under REVIEW_ROOT is ever written; `clone_repo` writes only inside the clone directory."""
 import fnmatch
 import json
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
 
-from .guardrails import DIMENSIONS, is_secret_file, redact, review_root, safe_path
+from .guardrails import DIMENSIONS, clone_root, is_secret_file, parse_github_url, redact, review_root, safe_path
 
 MAX_FILES = 5000
 MAX_TREE = 80
 MAX_READ = 20000
 DEFAULT_READ = 3000
+CLONE_TIMEOUT = 120
 BIG_FILE = 5 * 1024 * 1024
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".tox", ".pytest_cache",
              ".mypy_cache", ".ruff_cache", ".adk"}
@@ -146,9 +150,10 @@ def compute_signals(root: Path) -> dict:
     check(2, "license", top_or_repo_root_has("license*", "licence*", "copying*"))
     check(2, "contributing", top_or_repo_root_has("contributing*") or any_has(".github/contributing*"))
     check(2, "code_of_conduct", top_or_repo_root_has("code_of_conduct*") or any_has(".github/code_of_conduct*"))
-    check(2, "issue_pr_templates", any_has(".github/issue_template*", ".github/pull_request_template*"))
+    check(2, "issue_pr_templates", any_has(".github/issue_template*", ".github/pull_request_template*",
+                                           ".gitlab/issue_templates/*", ".gitlab/merge_request_templates/*"))
     check(2, "tests", any_has("tests/*", "test/*", "__tests__/*", "*/test_*.py", "test_*.py", "*_test.py",
-                              "*.test.js", "*.test.ts", "*.spec.*"))
+                              "*.test.js", "*.test.ts", "*.spec.*", "spec/*", "*_spec.rb"))
     check(2, "lint_config", top_has("ruff.toml", ".ruff.toml", ".flake8", ".pylintrc", ".eslintrc*",
                                     "eslint.config.*", ".prettierrc*", ".pre-commit-config.yaml",
                                     ".editorconfig", "biome.json", ".golangci.y*ml", "rustfmt.toml")
@@ -199,9 +204,33 @@ def compute_signals(root: Path) -> dict:
         "total": sum(d["score"] for d in dimensions),
         "max": 5 * len(DIMENSIONS),
         "file_count": len(files),
+        "readme": readme_name,
         "tree": files[:MAX_TREE],
         "tree_truncated": len(files) > MAX_TREE,
     }
+
+
+@mcp.tool()
+def clone_repo(url: str) -> dict:
+    """Shallow-clone a public GitHub repo (https://github.com/<owner>/<repo>) and return its local path for scan_repo."""
+    owner, repo = parse_github_url(url)
+    base = clone_root()
+    base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if base.is_symlink() or base.stat().st_uid != os.getuid():
+        raise PermissionError(f"clone directory is not owned by this user: {base}")
+    dest = base / f"{owner}__{repo}".lower()
+    shutil.rmtree(dest, ignore_errors=True)  # always review the current default branch
+    # Public repos only: no stored credentials, no prompts, https only, no LFS downloads.
+    cmd = ["git", "-c", "credential.helper=", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+           "clone", "--depth", "1", "--single-branch", "--no-tags", "-q",
+           f"https://github.com/{owner}/{repo}.git", str(dest)]
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"}
+    try:
+        subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=CLONE_TIMEOUT, check=True)
+    except (subprocess.SubprocessError, OSError):
+        shutil.rmtree(dest, ignore_errors=True)
+        raise ValueError(f"clone failed (repo missing, private, or too slow to fetch): {owner}/{repo}") from None
+    return {"path": str(dest), "next": "Call scan_repo with this path."}
 
 
 @mcp.tool()
@@ -210,7 +239,9 @@ def scan_repo(path: str) -> dict:
     root = safe_path(path)
     if not root.is_dir():
         raise ValueError(f"not a directory: {path}")
-    return {"path": str(root), **compute_signals(root)}
+    result = compute_signals(root)
+    readme = result.pop("readme")
+    return {"path": str(root), "readme_path": str(root / readme) if readme else None, **result}
 
 
 @mcp.tool()

@@ -19,8 +19,11 @@ You review a local repository the way a new adopter or maintainer would, and ret
 concrete fixes. You do NOT review code style, bugs, or code security.
 
 Procedure:
-1. Call `scan_repo` once with the repository path the user gave. If they gave none, ask for one.
-2. Optionally call `read_file` on README.md only, at most once, to judge clarity. Never read other files.
+1. If the user gave a GitHub URL (https://github.com/<owner>/<repo>), call `clone_repo` with it once and use the
+   `path` it returns. Then call `scan_repo` once with that path or the local path the user gave. If they gave
+   neither, ask for one.
+2. Optionally call `read_file` once with the `readme_path` returned by `scan_repo` (never a bare "README.md"),
+   to judge clarity. Never read other files.
 3. Write the report below as your final message. Scores come from `scan_repo`; copy them exactly, never
    compute or adjust them. `issues` are failed checks; `passing` are satisfied checks.
 
@@ -64,7 +67,7 @@ root_agent = LlmAgent(
             env={**{k: v for k, v in os.environ.items() if not k.endswith("_API_KEY")},
                  "REVIEW_ROOT": os.environ.get("REVIEW_ROOT", str(Path.cwd()))},
         ),
-        timeout=30,
+        timeout=150,  # must exceed clone_repo's 120 s git timeout, or slow clones are abandoned and retried
     ))],
     before_model_callback=before_model_callback,
     before_tool_callback=before_tool_callback,

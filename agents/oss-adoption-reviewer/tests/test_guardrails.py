@@ -1,10 +1,12 @@
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from reviewer.guardrails import after_model_callback, after_tool_callback, before_tool_callback, redact, safe_path
-from reviewer.repo_mcp import read_file, scan_repo
+from reviewer.guardrails import (after_model_callback, after_tool_callback, before_tool_callback, parse_github_url, redact,
+                                 safe_path)
+from reviewer.repo_mcp import clone_repo, read_file, scan_repo
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -104,7 +106,7 @@ def test_non_report_reply_is_redacted_but_not_checked():
 
 
 def test_reported_scores_are_held_to_scan_repo():
-    scan = {"dimensions": [{"name": d, "score": 0} for d in DIMS]}
+    scan = {"dimensions": [{"name": d, "score": 0, "issues": ["missing:license"]} for d in DIMS]}
     ctx = Ctx()
     # The real MCP result carries the JSON in a text block (no structuredContent).
     after_tool_callback(Tool("scan_repo"), {}, ctx, {"content": [{"type": "text", "text": json.dumps(scan)}], "isError": False})
@@ -115,6 +117,14 @@ def test_reported_scores_are_held_to_scan_repo():
     assert "Scores corrected to match `scan_repo`: Usefulness & clarity 5→0" in text
 
 
+def test_perfect_repo_needs_no_citations():
+    scan = {"dimensions": [{"name": d, "score": 5, "issues": []} for d in DIMS]}
+    ctx = Ctx()
+    after_tool_callback(Tool("scan_repo"), {}, ctx, {"content": [{"type": "text", "text": json.dumps(scan)}]})
+    report = "\n".join(f"## {d} — 5/5" for d in DIMS) + "\n## Top 5 fixes\nNothing to fix."
+    assert "Output check failed" not in after_model_callback(ctx, _resp(report)).content.parts[0].text
+
+
 def test_before_model_callback_caps_calls(monkeypatch):
     from reviewer.guardrails import before_model_callback
 
@@ -123,3 +133,51 @@ def test_before_model_callback_caps_calls(monkeypatch):
     assert before_model_callback(ctx, None) is None
     assert before_model_callback(ctx, None) is None
     assert "call limit" in before_model_callback(ctx, None).content.parts[0].text
+
+
+GOOD_URLS = ["https://github.com/pallets/flask", "https://github.com/pallets/flask.git", "https://github.com/a/b.c/"]
+BAD_URLS = ["http://github.com/a/b", "https://github.com/a", "https://github.com/a/b/tree/main", "file:///etc",
+            "https://github.com.evil.com/a/b", "git@github.com:a/b", "https://x@github.com/a/b", "--upload-pack=x",
+            "https://github.com/a/..", "https://github.com/-a/b", "https://github.com/a/b?x=1"]
+
+
+def test_github_url_allow_list():
+    assert [parse_github_url(u) for u in GOOD_URLS] == [("pallets", "flask"), ("pallets", "flask"), ("a", "b.c")]
+    for bad in BAD_URLS:
+        with pytest.raises(ValueError):
+            parse_github_url(bad)
+        assert "error" in before_tool_callback(Tool("clone_repo"), {"url": bad}, None)
+    assert before_tool_callback(Tool("clone_repo"), {"url": GOOD_URLS[0]}, None) is None
+
+
+def test_clone_dir_is_inside_the_sandbox(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLONE_DIR", str(tmp_path / "clones"))
+    (tmp_path / "clones" / "a__b").mkdir(parents=True)
+    assert safe_path(str(tmp_path / "clones" / "a__b")) == (tmp_path / "clones" / "a__b").resolve()
+    with pytest.raises(PermissionError):
+        safe_path(str(tmp_path))
+
+
+def test_clone_repo_runs_a_locked_down_shallow_clone(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLONE_DIR", str(tmp_path))
+    calls = []
+
+    def fake_run(cmd, env, **kw):
+        calls.append((cmd, env))
+        Path(cmd[-1]).mkdir()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    out = clone_repo("https://github.com/Pallets/Flask.git/")
+    cmd, env = calls[0]
+    assert out["path"] == str(tmp_path.resolve() / "pallets__flask")
+    assert cmd[-2] == "https://github.com/Pallets/Flask.git" and "--depth" in cmd and "credential.helper=" in cmd
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+    def failing_run(cmd, env, **kw):
+        Path(cmd[-1]).mkdir()
+        raise subprocess.CalledProcessError(128, cmd)
+
+    monkeypatch.setattr(subprocess, "run", failing_run)
+    with pytest.raises(ValueError, match="clone failed"):
+        clone_repo("https://github.com/a/private")
+    assert not (tmp_path / "a__private").exists()
